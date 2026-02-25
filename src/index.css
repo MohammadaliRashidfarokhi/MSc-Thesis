@@ -1,0 +1,51 @@
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;600&display=swap');
+
+:root {
+  color-scheme: light;
+  font-family: 'IBM Plex Sans', sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+
+  --font-body: 'IBM Plex Sans', sans-serif;
+  --font-display: 'Space Grotesk', sans-serif;
+  --ink: #1f1a16;
+  --muted: #5f5148;
+  --accent: #d86f2f;
+  --accent-2: #1f6b6a;
+  --panel: #fff4e8;
+  --stroke: #edd5c4;
+  --stroke-strong: #d7b79f;
+  --shadow: 0 28px 70px rgba(88, 62, 46, 0.18);
+  --shadow-soft: 0 12px 24px rgba(88, 62, 46, 0.12);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+  color: var(--ink);
+  background: radial-gradient(circle at top, rgba(255, 245, 231, 0.8), transparent 55%),
+    linear-gradient(135deg, #f6efe7 0%, #f3e3d6 40%, #efe1d4 100%);
+}
+
+#root {
+  min-height: 100vh;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button,
+input,
+textarea {
+  font-family: inherit;
+}
