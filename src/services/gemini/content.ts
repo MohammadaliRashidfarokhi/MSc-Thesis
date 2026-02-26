@@ -31,18 +31,22 @@ export type GeminiGenerateResponse = {
 export type GenerateContentOptions = {
   model?: string
   contents: GeminiContent[]
+  generationConfig?: {
+    responseMimeType?: string
+  }
   signal?: AbortSignal
 }
 
 export const generateContent = async ({
   model,
   contents,
+  generationConfig,
   signal,
 }: GenerateContentOptions) => {
   const resolved = resolveModel(model)
   return geminiJson<GeminiGenerateResponse>(`/models/${resolved}:generateContent`, {
     method: 'POST',
-    body: JSON.stringify({ contents }),
+    body: JSON.stringify({ contents, generationConfig }),
     signal,
   })
 }

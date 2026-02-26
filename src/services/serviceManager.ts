@@ -6,3 +6,5 @@ export type {
   PipelineStage,
   PipelineStageResult,
 } from './workflows/pipelineWorkflow'
+
+export { runAssertionCheckerPipeline, ASSERTION_PIPELINE_STAGES } from './workflows/assertionPipelineWorkflow'

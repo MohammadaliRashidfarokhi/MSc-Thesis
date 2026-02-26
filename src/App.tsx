@@ -1,7 +1,7 @@
 import { useMemo, useRef, useState } from 'react'
 import {
-  PIPELINE_STAGES,
-  runArtifactPipeline,
+  ASSERTION_PIPELINE_STAGES,
+  runAssertionCheckerPipeline,
   type PipelineMode,
   type PipelineStage,
   type PipelineStageResult,
@@ -15,11 +15,116 @@ type SelectedFile = {
 
 type JsonObject = Record<string, unknown>
 type FinalOutputRow = {
-  stage: string
-  itemId: string
-  name: string
-  summary: string
-  details: string
+  reqId: string
+  testCaseId: string
+  status: string
+  confidence: string
+  reasoning: string
+  missingInfo: string
+}
+
+type MachineReportStage = {
+  stage_key: string
+  stage_label: string
+  parse_status: 'ok' | 'parse_error'
+  parse_error: string | null
+  payload: unknown
+  raw_output: string
+}
+
+type MachineReport = {
+  generated_at: string
+  total_stage_outputs: number
+  total_final_rows: number
+  stages: MachineReportStage[]
+  final_output_rows: FinalOutputRow[]
+}
+
+const FINAL_OUTPUT_FIELD_KEYS = {
+  reqId: ['req_id', 'requirement_id', 'requirementId', 'id', 'Req ID'],
+  testCaseId: ['test_case_id', 'testCaseId', 'test_id', 'tc_id', 'Test Case ID'],
+  status: [
+    'status',
+    'link_status',
+    'traceability_status',
+    'mapping_status',
+    'Link Status',
+  ],
+  confidence: [
+    'confidence',
+    'confidence_score',
+    'score',
+    'confidence (0-1)',
+    'confidence_0_1',
+    'confidence01',
+  ],
+  reasoning: [
+    'reasoning',
+    'evidence',
+    'evidence_backed_reasoning',
+    'summary',
+    'source_text',
+    'reasoning (evidence-backed)',
+    'evidence-backed reasoning',
+  ],
+  missingInfo: [
+    'missing_info',
+    'missingInfo',
+    'open_questions',
+    'notes',
+    'missing info',
+    'missing info (if smelly)',
+  ],
+} as const
+
+const normalizeLookupKey = (value: string) =>
+  value.toLowerCase().replace(/[^a-z0-9]/g, '')
+
+const pickFirst = (row: JsonObject, keys: string[]) => {
+  for (const key of keys) {
+    const value = row[key]
+    if (value !== undefined && value !== null && value !== '') {
+      return value
+    }
+  }
+
+  const normalizedRowEntries = Object.entries(row).reduce<Record<string, unknown>>(
+    (acc, [key, value]) => {
+      const normalized = normalizeLookupKey(key)
+      if (normalized && acc[normalized] === undefined) {
+        acc[normalized] = value
+      }
+      return acc
+    },
+    {}
+  )
+
+  for (const key of keys) {
+    const normalized = normalizeLookupKey(key)
+    const value = normalizedRowEntries[normalized]
+    if (value !== undefined && value !== null && value !== '') {
+      return value
+    }
+  }
+
+  return undefined
+}
+
+const extractRequirementsEntries = (payload: JsonObject) => {
+  const candidates = [
+    payload.requirements,
+    payload.mappings,
+    payload.traceability,
+    payload.traceability_links,
+    payload.links,
+    payload.rows,
+    payload.data,
+  ]
+  for (const candidate of candidates) {
+    const arr = toArray(candidate)
+    if (arr.length > 0) return arr
+  }
+  return []
 }
 
 const toObject = (value: unknown): JsonObject | null => {
@@ -38,14 +143,69 @@ const normalizeJsonText = (value: string) => {
   return trimmed.replace(/^```(?:json)?\s*/i, '').replace(/```$/, '').trim()
 }
 
+const extractJsonCandidate = (value: string) => {
+  const startObj = value.indexOf('{')
+  const startArr = value.indexOf('[')
+  let start = -1
+  if (startObj >= 0 && startArr >= 0) {
+    start = Math.min(startObj, startArr)
+  } else if (startObj >= 0) {
+    start = startObj
+  } else if (startArr >= 0) {
+    start = startArr
+  }
+  if (start < 0) return value
+  const lastObj = value.lastIndexOf('}')
+  const lastArr = value.lastIndexOf(']')
+  const end = Math.max(lastObj, lastArr)
+  if (end <= start) return value
+  return value.slice(start, end + 1)
+}
+
 const parseJsonOutput = (value: string) => {
   const normalized = normalizeJsonText(value)
   if (!normalized) return { data: null as unknown, error: 'Empty JSON response.' }
-  try {
-    return { data: JSON.parse(normalized) as unknown, error: null as string | null }
-  } catch {
+
+  const tryParse = (input: string): unknown | null => {
+    try {
+      return JSON.parse(input) as unknown
+    } catch {
+      return null
+    }
+  }
+
+  let parsed = tryParse(normalized)
+  if (parsed === null) {
+    parsed = tryParse(extractJsonCandidate(normalized))
+  }
+  if (parsed === null) {
     return { data: null as unknown, error: 'Invalid JSON response.' }
   }
+
+  if (typeof parsed === 'string') {
+    const nested = tryParse(parsed)
+    if (nested !== null) {
+      parsed = nested
+    }
+  }
+
+  return { data: parsed, error: null as string | null }
+}
+
+const normalizeStagePayload = (
+  stageKey: PipelineStageResult['key'],
+  data: unknown
+) => {
+  const payload = toObject(data)
+  if (payload) return payload
+  if (Array.isArray(data)) {
+    if (stageKey === 'requirements') return { requirements: data }
+    if (stageKey === 'assertion_checker') return { rows: data }
+    if (stageKey === 'tests') return { tests: data }
+    if (stageKey === 'queries') return { queries: data }
+    return { rows: data }
+  }
+  return null
 }
 
 const valueToCell = (value: unknown): string => {
@@ -60,21 +220,16 @@ const valueToCell = (value: unknown): string => {
   return String(value)
 }
 
-const assertionsToCell = (value: unknown): string => {
-  const assertions = toArray(value)
-  if (assertions.length === 0) return '-'
-  return assertions
-    .map((entry) => {
-      const item = toObject(entry)
-      if (!item) return valueToCell(entry)
-      const assertionText = valueToCell(item.assertion_text)
-      const snippet = valueToCell(item.evidence_snippet)
-      return `${assertionText} (snippet: ${snippet})`
-    })
-    .join('; ')
-}
-
 const toCsvCell = (value: string) => `"${value.replace(/"/g, '""')}"`
+
+const downloadBlob = (blob: Blob, fileName: string) => {
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement('a')
+  link.href = url
+  link.download = fileName
+  link.click()
+  URL.revokeObjectURL(url)
+}
 
 function App() {
   const [files, setFiles] = useState<SelectedFile[]>([])
@@ -115,6 +270,8 @@ function App() {
     return Array.from(map.values())
   }
 
+  const activePipelineStages = ASSERTION_PIPELINE_STAGES
+
   const handleProcessFiles = async (
     selectedFiles: File[],
     mode: PipelineMode = 'start'
@@ -138,7 +295,7 @@ function App() {
             }, {})
           : undefined
 
-      const result = await runArtifactPipeline({
+      const result = await runAssertionCheckerPipeline({
         files: selectedFiles,
         mode,
         previous,
@@ -200,26 +357,52 @@ function App() {
     [pipelineStages]
   )
   const finalOutputRows = useMemo(() => {
-    const rows: FinalOutputRow[] = []
+    const traceabilityRows: FinalOutputRow[] = []
+    const assertionRows: FinalOutputRow[] = []
 
     stageViews.forEach(({ stage, data, error }) => {
       if (error || !data) return
-      const payload = toObject(data)
+      const payload = normalizeStagePayload(stage.key, data)
       if (!payload) return
 
       if (stage.key === 'requirements') {
-        toArray(payload.requirements).forEach((entry) => {
+        extractRequirementsEntries(payload).forEach((entry) => {
           const row = toObject(entry) ?? {}
-          rows.push({
-            stage: 'requirements',
-            itemId: valueToCell(row.req_id),
-            name: valueToCell(row.title),
-            summary: valueToCell(row.source_text),
-            details: `Trigger: ${valueToCell(row.trigger)} | Expected: ${valueToCell(
-              row.expected_outcomes
-            )} | Negative: ${valueToCell(row.negative_cases)} | Questions: ${valueToCell(
-              row.open_questions
-            )}`,
+          const reqId = pickFirst(row, [...FINAL_OUTPUT_FIELD_KEYS.reqId])
+          const testCaseId = pickFirst(row, [...FINAL_OUTPUT_FIELD_KEYS.testCaseId])
+          const status = pickFirst(row, [...FINAL_OUTPUT_FIELD_KEYS.status])
+          const confidence = pickFirst(row, [...FINAL_OUTPUT_FIELD_KEYS.confidence])
+          const reasoning = pickFirst(row, [...FINAL_OUTPUT_FIELD_KEYS.reasoning])
+          const missingInfo = pickFirst(row, [...FINAL_OUTPUT_FIELD_KEYS.missingInfo])
+
+          traceabilityRows.push({
+            reqId: valueToCell(reqId),
+            testCaseId: valueToCell(testCaseId),
+            status: valueToCell(status),
+            confidence: valueToCell(confidence),
+            reasoning: valueToCell(reasoning),
+            missingInfo: valueToCell(missingInfo),
+          })
+        })
+      }
+
+      if (stage.key === 'assertion_checker') {
+        extractRequirementsEntries(payload).forEach((entry) => {
+          const row = toObject(entry) ?? {}
+          const reqId = pickFirst(row, [...FINAL_OUTPUT_FIELD_KEYS.reqId])
+          const testCaseId = pickFirst(row, [...FINAL_OUTPUT_FIELD_KEYS.testCaseId])
+          const status = pickFirst(row, [...FINAL_OUTPUT_FIELD_KEYS.status])
+          const confidence = pickFirst(row, [...FINAL_OUTPUT_FIELD_KEYS.confidence])
+          const reasoning = pickFirst(row, [...FINAL_OUTPUT_FIELD_KEYS.reasoning])
+          const missingInfo = pickFirst(row, [...FINAL_OUTPUT_FIELD_KEYS.missingInfo])
+
+          assertionRows.push({
+            reqId: valueToCell(reqId),
+            testCaseId: valueToCell(testCaseId),
+            status: valueToCell(status),
+            confidence: valueToCell(confidence),
+            reasoning: valueToCell(reasoning),
+            missingInfo: valueToCell(missingInfo),
           })
         })
       }
@@ -227,16 +410,19 @@ function App() {
       if (stage.key === 'tests') {
         toArray(payload.tests).forEach((entry) => {
           const row = toObject(entry) ?? {}
-          rows.push({
-            stage: 'tests',
-            itemId: valueToCell(row.test_id),
-            name: valueToCell(row.test_name),
-            summary: valueToCell(row.purpose_summary),
-            details: `File: ${valueToCell(row.file_path)} | Assertions: ${assertionsToCell(
-              row.assertions
-            )} | Components: ${valueToCell(row.touched_components)} | Tags: ${valueToCell(
-              row.tags
-            )}`,
+          traceabilityRows.push({
+            reqId: valueToCell(pickFirst(row, [...FINAL_OUTPUT_FIELD_KEYS.reqId])),
+            testCaseId: valueToCell(pickFirst(row, [...FINAL_OUTPUT_FIELD_KEYS.testCaseId])),
+            status: valueToCell(pickFirst(row, [...FINAL_OUTPUT_FIELD_KEYS.status])),
+            confidence: valueToCell(pickFirst(row, [...FINAL_OUTPUT_FIELD_KEYS.confidence])),
+            reasoning: valueToCell(
+              pickFirst(row, [
+                ...FINAL_OUTPUT_FIELD_KEYS.reasoning,
+                'purpose_summary',
+                'assertion_text',
+              ])
+            ),
+            missingInfo: valueToCell(pickFirst(row, [...FINAL_OUTPUT_FIELD_KEYS.missingInfo])),
           })
         })
       }
@@ -244,172 +430,100 @@ function App() {
       if (stage.key === 'queries') {
         toArray(payload.queries).forEach((entry) => {
           const row = toObject(entry) ?? {}
-          rows.push({
-            stage: 'queries',
-            itemId: valueToCell(row.target),
-            name: valueToCell(row.target),
-            summary: valueToCell(row.q),
-            details: `Keywords: ${valueToCell(payload.keywords)} | Entities: ${valueToCell(
-              payload.entities
-            )}`,
+          traceabilityRows.push({
+            reqId: valueToCell(pickFirst(row, [...FINAL_OUTPUT_FIELD_KEYS.reqId])),
+            testCaseId: valueToCell(pickFirst(row, [...FINAL_OUTPUT_FIELD_KEYS.testCaseId])),
+            status: valueToCell(pickFirst(row, [...FINAL_OUTPUT_FIELD_KEYS.status])),
+            confidence: valueToCell(pickFirst(row, [...FINAL_OUTPUT_FIELD_KEYS.confidence])),
+            reasoning: valueToCell(pickFirst(row, ['q', ...FINAL_OUTPUT_FIELD_KEYS.reasoning])),
+            missingInfo: valueToCell(pickFirst(row, [...FINAL_OUTPUT_FIELD_KEYS.missingInfo])),
           })
         })
       }
     })
 
-    return rows
+    return assertionRows.length ? assertionRows : traceabilityRows
   }, [stageViews])
+
+  const machineReport = useMemo<MachineReport>(() => {
+    return {
+      generated_at: new Date().toISOString(),
+      total_stage_outputs: stageViews.length,
+      total_final_rows: finalOutputRows.length,
+      stages: stageViews.map(({ stage, data, error }) => ({
+        stage_key: stage.key,
+        stage_label: stage.label,
+        parse_status: error ? 'parse_error' : 'ok',
+        parse_error: error,
+        payload: data,
+        raw_output: stage.outputText,
+      })),
+      final_output_rows: finalOutputRows,
+    }
+  }, [finalOutputRows, stageViews])
+  const machineReportText = useMemo(
+    () => JSON.stringify(machineReport, null, 2),
+    [machineReport]
+  )
+
+  const auditReportText = useMemo(() => {
+    if (!finalOutputRows.length) {
+      return 'No output rows available yet. Run the pipeline to generate the audit report.'
+    }
+
+    const header = [
+      'HUMAN-READABLE AUDIT REPORT',
+      `Generated At: ${new Date().toISOString()}`,
+      `Total Rows: ${finalOutputRows.length}`,
+      '',
+    ]
+
+    const lines = finalOutputRows.flatMap((row, index) => [
+      `${index + 1}. Req ID: ${row.reqId}`,
+      `   Test Case ID: ${row.testCaseId}`,
+      `   Status: ${row.status}`,
+      `   Confidence (0-1): ${row.confidence}`,
+      `   Reasoning: ${row.reasoning}`,
+      `   Missing Info: ${row.missingInfo}`,
+      '',
+    ])
+
+    return [...header, ...lines].join('\n')
+  }, [finalOutputRows])
 
   const handleDownloadFinalTable = () => {
     if (!finalOutputRows.length) return
-    const header = ['Stage', 'Item ID', 'Name', 'Summary', 'Details']
+    const header = [
+      'Req ID',
+      'Test Case ID',
+      'Status',
+      'Confidence (0-1)',
+      'Reasoning (Evidence-backed)',
+      'Missing Info (If Smelly)',
+    ]
     const body = finalOutputRows.map((row) => [
-      row.stage,
-      row.itemId,
-      row.name,
-      row.summary,
-      row.details,
+      row.reqId,
+      row.testCaseId,
+      row.status,
+      row.confidence,
+      row.reasoning,
+      row.missingInfo,
     ])
     const csv = [header, ...body]
       .map((line) => line.map((cell) => toCsvCell(cell)).join(','))
       .join('\n')
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
-    const url = URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    link.href = url
-    link.download = 'final-output-table.csv'
-    link.click()
-    URL.revokeObjectURL(url)
+    downloadBlob(blob, 'final-output-table.csv')
   }
 
-  const renderStageTable = (stageKey: PipelineStageResult['key'], data: unknown) => {
-    const payload = toObject(data)
-    if (!payload) {
-      return <p className="table-note">Response root is not a JSON object.</p>
-    }
+  const handleDownloadAuditReport = () => {
+    const blob = new Blob([auditReportText], { type: 'text/plain;charset=utf-8;' })
+    downloadBlob(blob, 'human-readable-audit-report.txt')
+  }
 
-    if (stageKey === 'requirements') {
-      const rows = toArray(payload.requirements)
-      if (rows.length === 0) return <p className="table-note">No requirements returned.</p>
-      return (
-        <div className="table-wrap">
-          <table className="result-table">
-            <thead>
-              <tr>
-                <th>Req ID</th>
-                <th>Title</th>
-                <th>Source Text</th>
-                <th>Preconditions</th>
-                <th>Trigger</th>
-                <th>Expected Outcomes</th>
-                <th>Negative Cases</th>
-                <th>Notes</th>
-                <th>Open Questions</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((entry, index) => {
-                const row = toObject(entry) ?? {}
-                return (
-                  <tr key={`requirement-${index}`}>
-                    <td className="table-cell">{valueToCell(row.req_id)}</td>
-                    <td className="table-cell">{valueToCell(row.title)}</td>
-                    <td className="table-cell">{valueToCell(row.source_text)}</td>
-                    <td className="table-cell">{valueToCell(row.preconditions)}</td>
-                    <td className="table-cell">{valueToCell(row.trigger)}</td>
-                    <td className="table-cell">{valueToCell(row.expected_outcomes)}</td>
-                    <td className="table-cell">{valueToCell(row.negative_cases)}</td>
-                    <td className="table-cell">{valueToCell(row.notes)}</td>
-                    <td className="table-cell">{valueToCell(row.open_questions)}</td>
-                  </tr>
-                )
-              })}
-            </tbody>
-          </table>
-        </div>
-      )
-    }
-
-    if (stageKey === 'tests') {
-      const rows = toArray(payload.tests)
-      if (rows.length === 0) return <p className="table-note">No tests returned.</p>
-      return (
-        <div className="table-wrap">
-          <table className="result-table">
-            <thead>
-              <tr>
-                <th>Test ID</th>
-                <th>File Path</th>
-                <th>Test Name</th>
-                <th>Purpose</th>
-                <th>Steps</th>
-                <th>Assertions</th>
-                <th>Touched Components</th>
-                <th>Tags</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((entry, index) => {
-                const row = toObject(entry) ?? {}
-                return (
-                  <tr key={`test-${index}`}>
-                    <td className="table-cell">{valueToCell(row.test_id)}</td>
-                    <td className="table-cell">{valueToCell(row.file_path)}</td>
-                    <td className="table-cell">{valueToCell(row.test_name)}</td>
-                    <td className="table-cell">{valueToCell(row.purpose_summary)}</td>
-                    <td className="table-cell">{valueToCell(row.steps)}</td>
-                    <td className="table-cell">{assertionsToCell(row.assertions)}</td>
-                    <td className="table-cell">{valueToCell(row.touched_components)}</td>
-                    <td className="table-cell">{valueToCell(row.tags)}</td>
-                  </tr>
-                )
-              })}
-            </tbody>
-          </table>
-        </div>
-      )
-    }
-
-    const queries = toArray(payload.queries)
-    return (
-      <div className="query-results">
-        {queries.length > 0 ? (
-          <div className="table-wrap">
-            <table className="result-table">
-              <thead>
-                <tr>
-                  <th>Target</th>
-                  <th>Query</th>
-                </tr>
-              </thead>
-              <tbody>
-                {queries.map((entry, index) => {
-                  const row = toObject(entry) ?? {}
-                  return (
-                    <tr key={`query-${index}`}>
-                      <td className="table-cell">{valueToCell(row.target)}</td>
-                      <td className="table-cell">{valueToCell(row.q)}</td>
-                    </tr>
-                  )
-                })}
-              </tbody>
-            </table>
-          </div>
-        ) : (
-          <p className="table-note">No queries returned.</p>
-        )}
-        <div className="query-meta">
-          <div>
-            <p className="meta-label">Keywords</p>
-            <p className="meta-value">{valueToCell(payload.keywords)}</p>
-          </div>
-          <div>
-            <p className="meta-label">Entities</p>
-            <p className="meta-value">{valueToCell(payload.entities)}</p>
-          </div>
-        </div>
-      </div>
-    )
+  const handleDownloadMachineReport = () => {
+    const blob = new Blob([machineReportText], { type: 'application/json;charset=utf-8;' })
+    downloadBlob(blob, 'machine-readable-report.json')
   }
 
   return (
@@ -492,7 +606,7 @@ function App() {
         {error && <div className="error">{error}</div>}
 
         <div className="stage-list">
-          {PIPELINE_STAGES.map((stage) => {
+          {activePipelineStages.map((stage) => {
             const done = pipelineStages.some((item) => item.key === stage.key)
             const active = activeStage?.key === stage.key && isProcessing
             return (
@@ -509,40 +623,11 @@ function App() {
           })}
         </div>
 
-        <div className="results-panel">
-          <div className="results-header">
-            <h3>Structured stage output</h3>
-            <p>Each pipeline response is parsed and displayed in table form.</p>
-          </div>
-          {stageViews.length === 0 ? (
-            <div className="empty-state">
-              <p>No stage output yet.</p>
-              <span>Upload files to run the pipeline and populate the tables.</span>
-            </div>
-          ) : (
-            stageViews.map(({ stage, data, error }) => (
-              <article key={`stage-result-${stage.key}`} className="result-card">
-                <div className="result-card-header">
-                  <h4>{stage.label}</h4>
-                </div>
-                {error || !data ? (
-                  <div className="result-raw">
-                    <p className="table-note">{error ?? 'Unable to render JSON response.'}</p>
-                    <pre>{stage.outputText}</pre>
-                  </div>
-                ) : (
-                  renderStageTable(stage.key, data)
-                )}
-              </article>
-            ))
-          )}
-        </div>
-
         <div className="final-table-panel">
           <div className="final-table-header">
             <div>
               <h3>Final output table</h3>
-              <p>Combined rows from all three stages.</p>
+              <p>Combined rows from pipeline stages.</p>
             </div>
             <div className="final-table-actions">
               <button
@@ -581,27 +666,64 @@ function App() {
               <table className="result-table">
                 <thead>
                   <tr>
-                    <th>Stage</th>
-                    <th>Item ID</th>
-                    <th>Name</th>
-                    <th>Summary</th>
-                    <th>Details</th>
+                    <th>Req ID</th>
+                    <th>Test Case ID</th>
+                    <th>Status</th>
+                    <th>Confidence (0-1)</th>
+                    <th>Reasoning (Evidence-backed)</th>
+                    <th>Missing Info (If Smelly)</th>
                   </tr>
                 </thead>
                 <tbody>
                   {finalOutputRows.map((row, index) => (
                     <tr key={`final-row-${index}`}>
-                      <td className="table-cell">{row.stage}</td>
-                      <td className="table-cell">{row.itemId}</td>
-                      <td className="table-cell">{row.name}</td>
-                      <td className="table-cell">{row.summary}</td>
-                      <td className="table-cell">{row.details}</td>
+                      <td className="table-cell">{row.reqId}</td>
+                      <td className="table-cell">{row.testCaseId}</td>
+                      <td className="table-cell">{row.status}</td>
+                      <td className="table-cell">{row.confidence}</td>
+                      <td className="table-cell">{row.reasoning}</td>
+                      <td className="table-cell">{row.missingInfo}</td>
                     </tr>
                   ))}
                 </tbody>
               </table>
             </div>
           )}
+        </div>
+
+        <div className="report-panel">
+          <div className="report-header">
+            <div>
+              <h3>Output 1: Human-readable audit report</h3>
+              <p>Narrative report generated from the final output rows.</p>
+            </div>
+            <button
+              type="button"
+              className="secondary"
+              onClick={handleDownloadAuditReport}
+            >
+              Download audit report
+            </button>
+          </div>
+          <pre className="report-pre">{auditReportText}</pre>
+        </div>
+
+        <div className="report-panel">
+          <div className="report-header">
+            <div>
+              <h3>Output 2: Machine-readable JSON (Next Agent Input)</h3>
+              <p>Structured JSON payload for downstream agent processing.</p>
+            </div>
+            <button
+              type="button"
+              className="secondary"
+              onClick={handleDownloadMachineReport}
+              disabled={!stageViews.length}
+            >
+              Download machine JSON
+            </button>
+          </div>
+          <pre className="report-pre report-pre-json">{machineReportText}</pre>
         </div>
 
         <div className="file-list">
