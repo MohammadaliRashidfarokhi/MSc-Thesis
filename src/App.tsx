@@ -80,10 +80,52 @@ const FINAL_OUTPUT_FIELD_KEYS = {
 const normalizeLookupKey = (value: string) =>
   value.toLowerCase().replace(/[^a-z0-9]/g, '')
 
+const isEmptyCellValue = (value: unknown) =>
+  value === undefined ||
+  value === null ||
+  value === '' ||
+  value === '-' ||
+  value === 'N/A' ||
+  value === 'n/a'
+
+const pickDeepByNormalizedKeys = (row: JsonObject, keys: string[]) => {
+  const target = new Set(keys.map((key) => normalizeLookupKey(key)))
+  const visited = new Set<object>()
+  const stack: unknown[] = [row]
+
+  while (stack.length > 0) {
+    const current = stack.pop()
+    if (!current || typeof current !== 'object') continue
+
+    if (Array.isArray(current)) {
+      current.forEach((entry) => stack.push(entry))
+      continue
+    }
+
+    if (visited.has(current)) continue
+    visited.add(current)
+
+    for (const [key, value] of Object.entries(current as Record<string, unknown>)) {
+      const normalized = normalizeLookupKey(key)
+      if (target.has(normalized) && !isEmptyCellValue(value)) {
+        return value
+      }
+    }
+
+    for (const value of Object.values(current as Record<string, unknown>)) {
+      if (value && typeof value === 'object') {
+        stack.push(value)
+      }
+    }
+  }
+
+  return undefined
+}
+
 const pickFirst = (row: JsonObject, keys: string[]) => {
   for (const key of keys) {
     const value = row[key]
-    if (value !== undefined && value !== null && value !== '') {
+    if (!isEmptyCellValue(value)) {
       return value
     }
   }
@@ -102,9 +144,14 @@ const pickFirst = (row: JsonObject, keys: string[]) => {
   for (const key of keys) {
     const normalized = normalizeLookupKey(key)
     const value = normalizedRowEntries[normalized]
-    if (value !== undefined && value !== null && value !== '') {
+    if (!isEmptyCellValue(value)) {
       return value
     }
+  }
+
+  const deepValue = pickDeepByNormalizedKeys(row, keys)
+  if (!isEmptyCellValue(deepValue)) {
+    return deepValue
   }
 
   return undefined
@@ -442,7 +489,32 @@ function App() {
       }
     })
 
-    return assertionRows.length ? assertionRows : traceabilityRows
+    if (!assertionRows.length) {
+      return traceabilityRows
+    }
+
+    const traceabilityByReqAndTest = new Map(
+      traceabilityRows.map((row) => [`${row.reqId}::${row.testCaseId}`, row])
+    )
+    const traceabilityByReq = new Map(
+      traceabilityRows.map((row) => [row.reqId, row])
+    )
+
+    return assertionRows.map((row) => {
+      const exact = traceabilityByReqAndTest.get(`${row.reqId}::${row.testCaseId}`)
+      const byReq = traceabilityByReq.get(row.reqId)
+      const fallback = exact ?? byReq
+
+      return {
+        ...row,
+        confidence:
+          row.confidence !== '-' ? row.confidence : fallback?.confidence ?? '-',
+        reasoning:
+          row.reasoning !== '-' ? row.reasoning : fallback?.reasoning ?? '-',
+        missingInfo:
+          row.missingInfo !== '-' ? row.missingInfo : fallback?.missingInfo ?? '-',
+      }
+    })
   }, [stageViews])
 
   const machineReport = useMemo<MachineReport>(() => {
