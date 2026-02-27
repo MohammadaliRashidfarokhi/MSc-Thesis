@@ -40,6 +40,40 @@ type MachineReport = {
   final_output_rows: FinalOutputRow[]
 }
 
+type OrchestratorIntakeResponse = {
+  orchestrator_run_id: string
+  received_at: string
+  report_rows: number
+  queued_hypotheses: number
+  hypotheses?: Array<{
+    hypothesis_id: string
+    requirement_id: string
+    test_id: string
+    status: string
+  }>
+  next_step?: string
+}
+
+type OrchestratorRepairLoopResponse = {
+  orchestrator_run_id: string
+  status: string
+  total_hypotheses: number
+  closed: number
+  high_complexity: number
+  results?: Array<{
+    hypothesis_id: string
+    requirement_id: string
+    test_id: string
+    status: string
+    attempts?: Array<{
+      attempt: number
+      temperature: number
+      test_passed: boolean
+      test_summary: string
+    }>
+  }>
+}
+
 const FINAL_OUTPUT_FIELD_KEYS = {
   reqId: ['req_id', 'requirement_id', 'requirementId', 'id', 'Req ID'],
   testCaseId: ['test_case_id', 'testCaseId', 'test_id', 'tc_id', 'Test Case ID'],
@@ -278,9 +312,60 @@ const downloadBlob = (blob: Blob, fileName: string) => {
   URL.revokeObjectURL(url)
 }
 
+const extractAssertionReportFromStages = (stages: PipelineStageResult[]) => {
+  const assertionStage = stages.find((stage) => stage.key === 'assertion_checker')
+  if (!assertionStage) {
+    return { report: null as unknown, error: 'Assertion checker output not found.' }
+  }
+
+  const parsed = parseJsonOutput(assertionStage.outputText)
+  if (parsed.error || !parsed.data) {
+    return { report: null as unknown, error: parsed.error ?? 'Invalid assertion checker JSON.' }
+  }
+
+  const payload = normalizeStagePayload('assertion_checker', parsed.data)
+  if (!payload) {
+    return { report: null as unknown, error: 'Assertion checker output payload is not a JSON object/array.' }
+  }
+
+  return { report: payload, error: null as string | null }
+}
+
+const summarizeAssertionStage = (stage: PipelineStageResult | undefined) => {
+  if (!stage) return 'Assertion checker output not found.'
+
+  const parsed = parseJsonOutput(stage.outputText)
+  if (parsed.error || !parsed.data) {
+    return `Assertion checker completed with parse error: ${parsed.error ?? 'unknown error'}.`
+  }
+
+  const payload = normalizeStagePayload('assertion_checker', parsed.data)
+  if (!payload) return 'Assertion checker completed but payload is not a JSON object/array.'
+
+  const entries = extractRequirementsEntries(payload)
+  if (!entries.length) return 'Assertion checker completed with 0 rows.'
+
+  const statusCounts = new Map<string, number>()
+  entries.forEach((entry) => {
+    const row = toObject(entry)
+    if (!row) return
+    const status = valueToCell(pickFirst(row, [...FINAL_OUTPUT_FIELD_KEYS.status]))
+    statusCounts.set(status, (statusCounts.get(status) ?? 0) + 1)
+  })
+
+  const mix = Array.from(statusCounts.entries())
+    .map(([status, count]) => `${status}: ${count}`)
+    .join(', ')
+
+  return `Assertion checker completed. Rows: ${entries.length}. Status mix: ${mix || '-'}.`
+}
+
 function App() {
   const [files, setFiles] = useState<SelectedFile[]>([])
   const [isProcessing, setIsProcessing] = useState(false)
+  const [isOrchestratorRunning, setIsOrchestratorRunning] = useState(false)
+  const [orchestratorLogs, setOrchestratorLogs] = useState<string[]>([])
+  const [assertionCheckerLogs, setAssertionCheckerLogs] = useState<string[]>([])
   const [error, setError] = useState<string | null>(null)
   const [pipelineStages, setPipelineStages] = useState<PipelineStageResult[]>([])
   const [activeStage, setActiveStage] = useState<PipelineStage | null>(null)
@@ -319,6 +404,101 @@ function App() {
 
   const activePipelineStages = ASSERTION_PIPELINE_STAGES
 
+  const appendOrchestratorLog = (message: string) => {
+    const timestamp = new Date().toLocaleTimeString()
+    setOrchestratorLogs((prev) => [...prev, `[${timestamp}] ${message}`])
+  }
+
+  const appendAssertionCheckerLog = (message: string) => {
+    const timestamp = new Date().toLocaleTimeString()
+    setAssertionCheckerLogs((prev) => [...prev, `[${timestamp}] ${message}`])
+  }
+
+  const runOrchestratorIntake = async (
+    stages: PipelineStageResult[],
+    signal: AbortSignal
+  ) => {
+    const extracted = extractAssertionReportFromStages(stages)
+    if (extracted.error || !extracted.report) {
+      appendOrchestratorLog(
+        `Orchestrator intake skipped: ${extracted.error ?? 'no assertion report available'}.`
+      )
+      return
+    }
+
+    setIsOrchestratorRunning(true)
+    appendOrchestratorLog('Sending assertion checker report to orchestrator intake.')
+
+    try {
+      const response = await fetch('/api/orchestrator/intake-assertion-report', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          assertion_report: extracted.report,
+        }),
+        signal,
+      })
+
+      if (!response.ok) {
+        const message = `${response.status} ${response.statusText}`
+        throw new Error(`Orchestrator intake failed: ${message}`)
+      }
+
+      const data = (await response.json()) as OrchestratorIntakeResponse
+
+      appendOrchestratorLog(
+        `Intake accepted. Run ID: ${data.orchestrator_run_id}. Rows: ${data.report_rows}. Queued hypotheses: ${data.queued_hypotheses}.`
+      )
+      if (data.hypotheses?.length) {
+        const preview = data.hypotheses
+          .slice(0, 3)
+          .map((entry) => `${entry.hypothesis_id}:${entry.requirement_id}/${entry.test_id}(${entry.status})`)
+          .join(', ')
+        appendOrchestratorLog(`Queued preview: ${preview}${data.hypotheses.length > 3 ? ', ...' : ''}`)
+      }
+      if (data.next_step) {
+        appendOrchestratorLog(`Next step: ${data.next_step}`)
+      }
+
+      appendOrchestratorLog('Running Middleware Bridge for queued hypotheses.')
+      const runResponse = await fetch('/api/orchestrator/run-repair-loop', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          orchestrator_run_id: data.orchestrator_run_id,
+        }),
+        signal,
+      })
+
+      if (!runResponse.ok) {
+        const message = `${runResponse.status} ${runResponse.statusText}`
+        throw new Error(`Orchestrator repair loop failed: ${message}`)
+      }
+
+      const runData = (await runResponse.json()) as OrchestratorRepairLoopResponse
+      appendOrchestratorLog(
+        `Repair loop completed. closed=${runData.closed}, high_complexity=${runData.high_complexity}, total=${runData.total_hypotheses}.`
+      )
+      if (runData.results?.length) {
+        runData.results.slice(0, 3).forEach((result) => {
+          const lastAttempt = result.attempts?.[result.attempts.length - 1]
+          appendOrchestratorLog(
+            `${result.hypothesis_id} ${result.requirement_id}/${result.test_id} -> ${result.status} (attempts=${result.attempts?.length ?? 0}${lastAttempt ? `, final_temp=${lastAttempt.temperature}` : ''}).`
+          )
+        })
+        if (runData.results.length > 3) {
+          appendOrchestratorLog(`...and ${runData.results.length - 3} more hypotheses.`)
+        }
+      }
+    } finally {
+      setIsOrchestratorRunning(false)
+    }
+  }
+
   const handleProcessFiles = async (
     selectedFiles: File[],
     mode: PipelineMode = 'start'
@@ -330,6 +510,9 @@ function App() {
 
     setIsProcessing(true)
     setError(null)
+    setOrchestratorLogs([])
+    setAssertionCheckerLogs([])
+    setIsOrchestratorRunning(false)
     setPipelineStages([])
     setActiveStage(null)
 
@@ -347,9 +530,25 @@ function App() {
         mode,
         previous,
         signal: controller.signal,
-        onStageChange: (stage) => setActiveStage(stage),
+        onStageChange: (stage) => {
+          setActiveStage(stage)
+          if (stage.key === 'requirements') {
+            appendAssertionCheckerLog('Traceability mapper started.')
+          }
+          if (stage.key === 'assertion_checker') {
+            appendAssertionCheckerLog('Assertion checker started.')
+          }
+        },
       })
       setPipelineStages(result.stages)
+      appendAssertionCheckerLog(
+        summarizeAssertionStage(
+          result.stages.find((stage) => stage.key === 'assertion_checker')
+        )
+      )
+      appendAssertionCheckerLog('Assertion checker finished. Sending report to orchestrator intake.')
+      setActiveStage(null)
+      await runOrchestratorIntake(result.stages, controller.signal)
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') {
         return
@@ -377,6 +576,9 @@ function App() {
   const handleClear = () => {
     setFiles([])
     setError(null)
+    setOrchestratorLogs([])
+    setAssertionCheckerLogs([])
+    setIsOrchestratorRunning(false)
     setPipelineStages([])
     setActiveStage(null)
     requestRef.current?.abort()
@@ -387,6 +589,9 @@ function App() {
 
   const handleRemove = (id: string) => {
     setFiles((prev) => prev.filter((entry) => entry.id !== id))
+    setOrchestratorLogs([])
+    setAssertionCheckerLogs([])
+    setIsOrchestratorRunning(false)
     setPipelineStages([])
     setActiveStage(null)
   }
@@ -670,7 +875,12 @@ function App() {
           <div className="processing">
             <span className="spinner" aria-hidden="true" />
             <span>
-              Processing{activeStage ? ` - ${activeStage.label}` : ''}
+              Processing
+              {activeStage
+                ? ` - ${activeStage.label}`
+                : isOrchestratorRunning
+                  ? ' - Orchestrator Intake'
+                  : ''}
             </span>
           </div>
         )}
@@ -693,6 +903,34 @@ function App() {
               </div>
             )
           })}
+        </div>
+
+        <div className="report-panel">
+          <div className="report-header">
+            <div>
+              <h3>Assertion checker log</h3>
+              <p>Traceability and assertion execution timeline</p>
+            </div>
+          </div>
+          <pre className="report-pre report-pre-json">
+            {assertionCheckerLogs.length > 0
+              ? assertionCheckerLogs.join('\n')
+              : 'No assertion checker activity yet.'}
+          </pre>
+        </div>
+
+        <div className="report-panel">
+          <div className="report-header">
+            <div>
+              <h3>Orchestrator intake log</h3>
+              <p>Traceability - Assertion Checker - Orchestrator Intake</p>
+            </div>
+          </div>
+          <pre className="report-pre report-pre-json">
+            {orchestratorLogs.length > 0
+              ? orchestratorLogs.join('\n')
+              : 'No orchestrator intake activity yet.'}
+          </pre>
         </div>
 
         <div className="final-table-panel">
