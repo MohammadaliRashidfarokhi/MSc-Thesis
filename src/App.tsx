@@ -682,14 +682,14 @@ function App() {
     <div className="page">
       <header className="hero">
         <p className="eyebrow">Multi Agent System</p>
-        <h1>Upload your artificat.</h1>
+        <h1>Upload your artifacts.</h1>
         <p className="hero-copy">
           Select multiple files, artifact eg: test cases, test suit, requirment document etc..
         </p>
         <div className="hero-stats">
           <div>
             <span className="stat-value">{files.length || 0}</span>
-            <span className="stat-label">Files queued</span>
+            <span className="stat-label">Files queued</span>W
           </div>
           <div>
             <span className="stat-value">{formatBytes(totalSize)}</span>
