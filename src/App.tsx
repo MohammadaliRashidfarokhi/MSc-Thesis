@@ -1,8 +1,8 @@
 import { useMemo, useRef, useState } from 'react'
 import {
-  ASSERTION_PIPELINE_STAGES,
-  runAssertionCheckerPipeline,
-} from './services/workflows/assertionPipelineWorkflow'
+  PIPELINE_STAGES,
+  runArtifactPipeline,
+} from './services/workflows/pipelineWorkflow'
 import type {
   PipelineMode,
   PipelineStage,
@@ -42,9 +42,68 @@ type MachineReport = {
   final_output_rows: FinalOutputRow[]
 }
 
+const LIBEST_REQUIREMENT_MODULES = import.meta.glob('/src/dataset/req/*.txt', {
+  eager: true,
+  query: '?raw',
+  import: 'default',
+}) as Record<string, string>
+
+const LIBEST_CODE_MODULES = import.meta.glob('/src/dataset/code/*.{c,h}', {
+  eager: true,
+  query: '?raw',
+  import: 'default',
+}) as Record<string, string>
+
+const fileNameFromPath = (filePath: string) => {
+  const parts = filePath.split('/')
+  return parts[parts.length - 1] || filePath
+}
+
+const createDatasetEntries = (): SelectedFile[] => {
+  const entries: SelectedFile[] = []
+
+  Object.entries(LIBEST_REQUIREMENT_MODULES)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .forEach(([filePath, text]) => {
+      entries.push({
+        id: filePath,
+        file: new File([String(text ?? '')], `req/${fileNameFromPath(filePath)}`, {
+          type: 'text/plain',
+        }),
+      })
+    })
+
+  Object.entries(LIBEST_CODE_MODULES)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .forEach(([filePath, content]) => {
+      const fileName = fileNameFromPath(filePath)
+      entries.push({
+        id: filePath,
+        file: new File([String(content ?? '')], `code/${fileName}`, {
+          type: 'text/plain',
+        }),
+      })
+    })
+
+  return entries
+}
+
+const DATASET_ENTRIES = createDatasetEntries()
+const DATASET_REQUIREMENT_COUNT = Object.keys(LIBEST_REQUIREMENT_MODULES).length
+const DATASET_CODE_COUNT = Object.keys(LIBEST_CODE_MODULES).length
+
 const FINAL_OUTPUT_FIELD_KEYS = {
   reqId: ['req_id', 'requirement_id', 'requirementId', 'id', 'Req ID'],
-  testCaseId: ['test_case_id', 'testCaseId', 'test_id', 'tc_id', 'Test Case ID'],
+  testCaseId: [
+    'test_case_id',
+    'testCaseId',
+    'test_id',
+    'tc_id',
+    'test_method',
+    'test_method_id',
+    'test_method_name',
+    'Test Case ID',
+  ],
   status: [
     'status',
     'link_status',
@@ -280,19 +339,19 @@ const downloadBlob = (blob: Blob, fileName: string) => {
   URL.revokeObjectURL(url)
 }
 
-const summarizeAssertionStage = (stage: PipelineStageResult | undefined) => {
-  if (!stage) return 'Assertion checker output not found.'
+const summarizeTraceabilityStage = (stage: PipelineStageResult | undefined) => {
+  if (!stage) return 'Traceability mapper output not found.'
 
   const parsed = parseJsonOutput(stage.outputText)
   if (parsed.error || !parsed.data) {
-    return `Assertion checker completed with parse error: ${parsed.error ?? 'unknown error'}.`
+    return `Traceability mapper completed with parse error: ${parsed.error ?? 'unknown error'}.`
   }
 
-  const payload = normalizeStagePayload('assertion_checker', parsed.data)
-  if (!payload) return 'Assertion checker completed but payload is not a JSON object/array.'
+  const payload = normalizeStagePayload('requirements', parsed.data)
+  if (!payload) return 'Traceability mapper completed but payload is not a JSON object/array.'
 
   const entries = extractRequirementsEntries(payload)
-  if (!entries.length) return 'Assertion checker completed with 0 rows.'
+  if (!entries.length) return 'Traceability mapper completed with 0 rows.'
 
   const statusCounts = new Map<string, number>()
   entries.forEach((entry) => {
@@ -306,17 +365,16 @@ const summarizeAssertionStage = (stage: PipelineStageResult | undefined) => {
     .map(([status, count]) => `${status}: ${count}`)
     .join(', ')
 
-  return `Assertion checker completed. Rows: ${entries.length}. Status mix: ${mix || '-'}.`
+  return `Traceability mapper completed. Rows: ${entries.length}. Status mix: ${mix || '-'}.`
 }
 
 function App() {
-  const [files, setFiles] = useState<SelectedFile[]>([])
+  const files = useMemo(() => DATASET_ENTRIES, [])
   const [isProcessing, setIsProcessing] = useState(false)
   const [logs, setLogs] = useState<string[]>([])
   const [error, setError] = useState<string | null>(null)
   const [pipelineStages, setPipelineStages] = useState<PipelineStageResult[]>([])
   const [activeStage, setActiveStage] = useState<PipelineStage | null>(null)
-  const inputRef = useRef<HTMLInputElement | null>(null)
   const requestRef = useRef<AbortController | null>(null)
 
   const totalSize = useMemo(
@@ -335,31 +393,15 @@ function App() {
     return `${value.toFixed(value >= 10 || index === 0 ? 0 : 1)} ${units[index]}`
   }
 
-  const toKey = (file: File) => `${file.name}-${file.size}-${file.lastModified}`
-
-  const mergeFiles = (existing: SelectedFile[], incoming: FileList | null) => {
-    if (!incoming) return existing
-    const map = new Map(existing.map((entry) => [entry.id, entry]))
-    Array.from(incoming).forEach((file) => {
-      const key = toKey(file)
-      if (!map.has(key)) {
-        map.set(key, { id: key, file })
-      }
-    })
-    return Array.from(map.values())
-  }
-
-  const activePipelineStages = ASSERTION_PIPELINE_STAGES
+  const activePipelineStages = PIPELINE_STAGES
 
   const appendLog = (message: string) => {
     const timestamp = new Date().toLocaleTimeString()
     setLogs((prev) => [...prev, `[${timestamp}] ${message}`])
   }
 
-  const handleProcessFiles = async (
-    selectedFiles: File[],
-    mode: PipelineMode = 'start'
-  ) => {
+  const handleProcessFiles = async (mode: PipelineMode = 'start') => {
+    const selectedFiles = files.map((entry) => entry.file)
     if (!selectedFiles.length) return
     const currentStages = pipelineStages
 
@@ -374,11 +416,11 @@ function App() {
     if (mode === 'continue' && currentStages.length > 0) {
       setLogs([])
       appendLog(
-        '[Assertion Checker] Continue mode: reusing previous traceability/assertion outputs (no new LLM call).'
+        '[Traceability Mapper] Continue mode: reusing previous output (no new LLM call).'
       )
 
       try {
-        appendLog('[Assertion Checker] Continue completed. Final report is ready.')
+        appendLog('[Traceability Mapper] Continue completed. Final report is ready.')
       } catch (err) {
         if (err instanceof DOMException && err.name === 'AbortError') {
           return
@@ -405,7 +447,7 @@ function App() {
             }, {})
           : undefined
 
-      const result = await runAssertionCheckerPipeline({
+      const result = await runArtifactPipeline({
         files: selectedFiles,
         mode,
         previous,
@@ -413,20 +455,17 @@ function App() {
         onStageChange: (stage) => {
           setActiveStage(stage)
           if (stage.key === 'requirements') {
-            appendLog('[Assertion Checker] Traceability mapper started.')
-          }
-          if (stage.key === 'assertion_checker') {
-            appendLog('[Assertion Checker] Assertion checker started.')
+            appendLog('[Traceability Mapper] Started.')
           }
         },
       })
       setPipelineStages(result.stages)
       appendLog(
-        summarizeAssertionStage(
-          result.stages.find((stage) => stage.key === 'assertion_checker')
+        summarizeTraceabilityStage(
+          result.stages.find((stage) => stage.key === 'requirements')
         )
       )
-      appendLog('[Assertion Checker] Finished. Final report ready.')
+      appendLog('[Traceability Mapper] Finished. Final report ready.')
       setActiveStage(null)
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') {
@@ -439,36 +478,6 @@ function App() {
       setIsProcessing(false)
       setActiveStage(null)
     }
-  }
-
-  const handleAddFiles = (incoming: FileList | null) => {
-    if (!incoming) return
-    const next = mergeFiles(files, incoming)
-    setFiles(next)
-    void handleProcessFiles(next.map((entry) => entry.file), 'start')
-  }
-
-  const handlePickFiles = () => {
-    inputRef.current?.click()
-  }
-
-  const handleClear = () => {
-    setFiles([])
-    setError(null)
-    setLogs([])
-    setPipelineStages([])
-    setActiveStage(null)
-    requestRef.current?.abort()
-    if (inputRef.current) {
-      inputRef.current.value = ''
-    }
-  }
-
-  const handleRemove = (id: string) => {
-    setFiles((prev) => prev.filter((entry) => entry.id !== id))
-    setLogs([])
-    setPipelineStages([])
-    setActiveStage(null)
   }
 
   const canFollowUp = pipelineStages.length > 0 && !isProcessing
@@ -682,14 +691,14 @@ function App() {
     <div className="page">
       <header className="hero">
         <p className="eyebrow">Multi Agent System</p>
-        <h1>Upload your artificat.</h1>
+        <h1>Run LibEST artifact set.</h1>
         <p className="hero-copy">
-          Select multiple files, artifact eg: test cases, test suit, requirment document etc..
+          Uses dataset files from <code>src/dataset/req</code> and <code>src/dataset/code</code>.
         </p>
         <div className="hero-stats">
           <div>
             <span className="stat-value">{files.length || 0}</span>
-            <span className="stat-label">Files queued</span>
+            <span className="stat-label">Dataset files</span>
           </div>
           <div>
             <span className="stat-value">{formatBytes(totalSize)}</span>
@@ -701,48 +710,24 @@ function App() {
       <section className="panel">
         <div className="panel-header">
           <div>
-            <h2>Upload files</h2>
+            <h2>Run dataset pipeline</h2>
             <p>
-              Choose multiple documents files to start interact with Multi Agent System
+              Traceability Mapper using local LibEST dataset artifacts.
             </p>
           </div>
           <div className="panel-actions">
-            <button
-              type="button"
-              className="ghost"
-              onClick={handleClear}
-              disabled={!files.length || isProcessing}
-            >
-              Clear all
-            </button>
-            <button type="button" className="primary" onClick={handlePickFiles} disabled={isProcessing}>
-              Select files
+            <button type="button" className="primary" onClick={() => handleProcessFiles('start')} disabled={isProcessing || files.length === 0}>
+              Run
             </button>
           </div>
         </div>
 
-        <div className="upload-box">
-          <input
-            ref={inputRef}
-            className="file-input"
-            type="file"
-            multiple
-            onChange={(event) => {
-              handleAddFiles(event.target.files)
-              event.currentTarget.value = ''
-            }}
-            disabled={isProcessing}
-          />
-          <div className="upload-hint">
-            <div className="upload-icon" aria-hidden="true">
-              <span />
-              <span />
-              <span />
-            </div>
-            <div>
-              <h3>Drop files here or use the button</h3>
-              <p>PDF, DOCX, TXT, or images. Up to 25MB per file.</p>
-            </div>
+        <div className="upload-hint">
+          <div>
+            <h3>Dataset source</h3>
+            <p>
+              Requirements: {DATASET_REQUIREMENT_COUNT} files | Code: {DATASET_CODE_COUNT} files
+            </p>
           </div>
         </div>
 
@@ -780,7 +765,7 @@ function App() {
           <div className="report-header">
             <div>
               <h3>Logs</h3>
-              <p>Traceability and Assertion Checker timeline</p>
+              <p>Traceability Mapper timeline</p>
             </div>
           </div>
           <pre className="report-pre report-pre-json">
@@ -800,7 +785,7 @@ function App() {
               <button
                 type="button"
                 className="ghost"
-                onClick={() => handleProcessFiles(files.map((entry) => entry.file), 'rerun')}
+                onClick={() => handleProcessFiles('rerun')}
                 disabled={!canFollowUp}
               >
                 Rerun
@@ -808,7 +793,7 @@ function App() {
               <button
                 type="button"
                 className="secondary"
-                onClick={() => handleProcessFiles(files.map((entry) => entry.file), 'continue')}
+                onClick={() => handleProcessFiles('continue')}
                 disabled={!canFollowUp}
               >
                 Continue
@@ -892,36 +877,6 @@ function App() {
           <pre className="report-pre report-pre-json">{machineReportText}</pre>
         </div>
 
-        <div className="file-list">
-          {files.length === 0 ? (
-            <div className="empty-state">
-              <p>No files added yet.</p>
-              <span>Select multiple files to begin.</span>
-            </div>
-          ) : (
-            <ul>
-              {files.map((entry, index) => (
-                <li key={entry.id} style={{ animationDelay: `${index * 0.05}s` }}>
-                  <div>
-                    <p className="file-name">{entry.file.name}</p>
-                    <p className="file-meta">
-                      {formatBytes(entry.file.size)} -{' '}
-                      {entry.file.type || 'Unknown type'}
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    className="text"
-                    onClick={() => handleRemove(entry.id)}
-                    disabled={isProcessing}
-                  >
-                    Remove
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
       </section>
     </div>
   )

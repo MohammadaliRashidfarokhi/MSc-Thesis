@@ -60,31 +60,31 @@ export const PIPELINE_STAGES: PipelineStage[] = [
 
     <Few_Shot_Anchors>
     <Example_Valid_Direct>
-    Req: REQ-1.1: "The system must lock the user account after 5 failed login attempts."
-    Code: @Test public void testAccountLockout() { for(int i=0; i<5; i++) { login('fail'); } assert(account.isLocked()); }
+    Req: REQ-EST-1.1: "The server shall lock an account after N consecutive failed authentication attempts."
+    Code: @Test public void test_auth_failures_trigger_lockout() { for(int i=0; i<N; i++) { estAuthenticate("badUser","badPass"); } assertTrue(isAccountLocked("badUser")); }
     Verdict: Direct. 
-    Reasoning: Functional alignment found. The test explicitly implements the threshold (5) and asserts the specific outcome (locked) defined in REQ-1.1.
+    Reasoning: Functional alignment found. The test drives the exact state transition (failed attempts → lockout) and asserts the required outcome (locked) defined in REQ-EST-1.1.
     </Example_Valid_Direct>
 
     <Example_Valid_Indirect>
-    Req: REQ-2.0: "User sessions shall timeout after 30 minutes of inactivity."
-    Code: @Test public void testSessionCreation() { Session s = createSession(); assertNotNull(s.getExpiry()); }
+    Req: REQ-EST-2.0: "The server shall support re-enrollment by accepting a valid client certificate and returning a renewed certificate."
+    Code: @Test public void test_reenroll_endpoint_exists_and_requires_client_cert() { HttpResponse r = post("/.well-known/est/simplereenroll", withClientCert(validCert)); assertEquals(200, r.status()); assertNotNull(r.body()); }
     Verdict: Indirect. 
-    Reasoning: Dependency alignment. The test verifies session expiry metadata exists but does not execute the 30-minute transition logic.
+    Reasoning: Dependency alignment. The test verifies the endpoint behavior and presence of a response body under client-cert conditions, but does not validate that the returned certificate is actually renewed relative to the prior certificate.
     </Example_Valid_Indirect>
 
     <Example_Invalid_None>
-    Req: REQ-3.5: "The system shall encrypt all stored passwords using AES-256."
-    Code: @Test public void testPasswordUpdate() { user.setPass('new'); assertEquals('new', user.getPass()); }
+    Req: REQ-EST-3.5: "The server shall use TLS for all EST endpoints and reject non-TLS requests."
+    Code: @Test public void test_csr_payload_is_parsed() { Csr csr = parseCsr(samplePem); assertNotNull(csr.getSubject()); }
     Verdict: None. 
-    Reasoning: Semantic mismatch. The test verifies data persistence but contains no logic or assertions related to encryption algorithms or storage security.
+    Reasoning: Semantic mismatch. The test verifies CSR parsing logic but contains no logic or assertions about transport security, TLS negotiation, or rejection of non-TLS requests.
     </Example_Invalid_None>
     </Few_Shot_Anchors>
 
     <Input_Artifacts>
-    <Requirement_Set_NL>{Input_Requirements}</Requirement_Set_NL>
-    <Test_Suite_Schema>{Input_Test_Suite_Metadata}</Test_Suite_Schema>
-    <Test_Code_Methods_PL>{Input_Test_Code}</Test_Code_Methods_PL>
+    <Requirement_Set_NL>{Input_LibEST_Requirements_NL}</Requirement_Set_NL>
+    <Test_Suite_Schema>{Input_LibEST_Test_Suite_Metadata}</Test_Suite_Schema>
+    <Test_Code_Methods_PL>{Input_LibEST_Test_Code_Methods_PL}</Test_Code_Methods_PL>
     </Input_Artifacts>
 
     <Reasoning_Protocol>
